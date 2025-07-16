@@ -1,0 +1,967 @@
+---
+title: "mediation"
+output: html_document
+date: '2025-06-27'
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("/restricted/projectnb/llfs/LinGA_protected/analysis/paola-phenotype-analysis/APOE_analysis/cognitive_function_biomarkers/")
+llfs.pheno.data <- "/restricted/projectnb/llfs/LinGA_protected/analysis/phenotype/archived_data_exports/llfs_allpheno_csv_06Mar2023/csv/"
+
+apoe.dir <- "/restricted/projectnb/necs/paola_analysis/meta_GWAS_EL/APOE/"
+llfs.pheno.dir <- "/restricted/projectnb/llfs/LinGA_protected/analysis/phenotype/update-age-analysis/results-updated-2023/"
+tics.dir <- "/restricted/projectnb/llfs/LinGA_protected/analysis/genetics/GWAS_CF_Zeyuan/TICS_random_slope/"
+cog.data.dir <- "/restricted/projectnb/llfs/LinGA_protected/analysis/paola-phenotype-analysis/extract_cognitive_data/"
+  
+rna.batch4.dir <- "/restricted/projectnb/llfs/LinGA_protected/analysis/genomics/transcriptomics/vanessa_analysis/batch4/data/QTL_pipeline_use/"
+
+data.change.dir <- "/restricted/projectnb/llfs/LinGA_protected/analysis/paola-phenotype-analysis/growths-curves/generation-change-data/"
+
+#library(Heatplus)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(MASS)
+
+
+library(boot)
+library(geepack)
+library(corrplot)
+library(glmtoolbox)
+library(reshape2)
+library(olsrr)
+library(gtsummary)
+
+set.seed(16)
+```
+
+## R Markdown
+```{r }
+setwd("/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/")
+```
+
+## 1- get APOE data - for now genotyped data. get WGS data from Harold/Zeyuan
+```{r }
+apoe.gwas <- read.csv(paste0(apoe.dir, "mega.apoe.data.09.13.2017.csv"),header=T, na.strings = c("", " ", "   ",NA))
+
+apoe.llfs <- apoe.gwas[which(apoe.gwas$Study == "llfs"),]
+apoe.llfs$subject <- str_replace(apoe.llfs$ID,"LLFS_","")
+apoe.llfs$gwas_vc <- 1
+table(apoe.llfs$APOE)
+
+apoe.wgs <- read.csv("/restricted/projectnb/llfs/LinGA_protected/analysis/genetics/LLFS_freeze5_WGS_Nastia/APOE/APOE_genotypes.csv") %>%
+  mutate( subject = as.character(ID))
+
+temp <- full_join(apoe.llfs, apoe.wgs, by="subject") %>%
+  dplyr::select( c(subject, APOE.x, APOE.y ))
+  
+  ## recode apoe
+temp$APOE.x[which( temp$APOE.x == "e3.e2")] <- "e2.e3"
+temp$APOE.x[which( temp$APOE.x == "e4.e2")] <- "e2.e4"
+temp$APOE.x[which( temp$APOE.x == "e4.e3")] <- "e3.e4"
+
+  
+  ## add missing genotypes
+temp$APOE.y[which(is.na(temp$APOE.y)==T & is.na(temp$APOE.x)==F)] <- 
+temp$APOE.x[which(is.na(temp$APOE.y)==T & is.na(temp$APOE.x)==F)]
+
+table(temp$APOE.x); sum(table(temp$APOE.x))
+table(temp$APOE.y); sum(table(temp$APOE.y))
+table(temp$APOE.x, temp$APOE.y)
+dim(temp)
+  
+apoe.llfs.wgs <- temp %>%
+  mutate(APOE = APOE.y) %>%
+    dplyr::select( c(subject, APOE ))%>%
+      dplyr::mutate( subject = as.character(subject))
+```
+## 3- get CDT outcomes
+```{r }
+#raw CDT data
+rawCDTfile <- read.csv( paste0(cog.data.dir,"archived/digital.metrics.csv"), header = T)
+
+rawCDTfile <- rawCDTfile %>%
+    dplyr::mutate(subject = as.character(subject), cdt.cmd.timecomplete.ori = cdt.cmd.timecomplete, cmd.inktime.ori = cmd.inktime,  cmd.thinktime.ori = cmd.thinktime, cmd.totaltime.ori = cmd.thinktime + cmd.inktime) %>%
+  dplyr::select(subject, Age.II, cdt.cmd.timecomplete.ori, cmd.inktime.ori, cmd.thinktime.ori, cmd.totaltime.ori) 
+```
+
+
+
+## 3B add demographics
+```{r}
+llfs.master <- read.csv(paste0(llfs.pheno.dir, "llfs.data.annotated.with.biomarkers.03.2023.csv")) %>%
+  dplyr::select(subject, sex, pedid, Age.consent, Age.last.contact, DOB, Education, Alive, DeathYear, DeathAge, 
+          ADRD.inc, ADRD.inc.age, ADRD.enrollment, ADRD.enrollment.age, ADRD.LC,ADRD.LC.age,
+          CVD.enrollment, CVD.enrollment.age, CVD.inc, CVD.inc.age,CVD.lc,CVD.lc.age) %>%
+    dplyr::mutate(subject = as.character(subject))%>%
+      dplyr:: mutate(master.vc =1) %>%
+        dplyr:: mutate(Sex = ifelse(sex == 1, "M", "F"))
+
+
+##bmi data
+data.change <- read.csv(paste0(data.change.dir, "data.change.05.04.2020.csv")) %>%
+  dplyr::select(subject, bmi.b) %>%
+   dplyr::mutate(subject = as.character(subject))
+```
+
+## 3D get lipids
+```{r }
+metab.list <- read.csv("/restricted/projectnb/llfs/LinGA_protected/analysis/paola-phenotype-analysis/APOE_analysis/cognitive_function_biomarkers/metab2apoe.csv",header=T)
+
+metab.batch6 <- read.csv("/restricted/projectnb/llfs/LinGA_protected/analysis/genomics/metabolomics/paola_analysis/aging_analysis/analysis.final.no.missing.dat.batch6.csv", header=T)
+
+metab.batch6 <- metab.batch6 %>%
+  filter(grepl("_1", metab.batch6$fake.subject, fixed = T))
+
+metab.names <- read.csv("/restricted/projectnb/llfs/LinGA_protected/analysis/genomics/metabolomics/paola_analysis/aging_analysis/metab.batch6.table.csv", header=T)
+
+#get the list of metabolites from Paola 2024
+get.metab <- metab.names[match(metab.list[,1],metab.names[,1]),2]
+     
+metab.llfs <- metab.batch6 %>%
+  dplyr::mutate(subject = as.character(subject)) %>%
+    dplyr::select(subject, get.metab) 
+```
+
+## 3E get medication data
+```{r}
+medication <- read.csv(paste0(llfs.pheno.data, "codedmeds_atc_all.csv"))
+medication <- medication %>% filter(visitcode == 1)
+medication$subject <- as.character(medication$subject)
+```
+
+## 4- aggregate into a single data set for analysis
+
+```{r }
+all.data <- llfs.master %>% 
+            dplyr::left_join(apoe.llfs.wgs, by = "subject") %>%
+                    dplyr::left_join(metab.llfs, by="subject") %>%
+                      dplyr::left_join(medication, by = "subject") %>%
+                        dplyr::left_join(rawCDTfile, by = "subject") %>%
+                          dplyr::left_join(data.change, by = "subject")
+
+
+temp <- all.data %>% filter(!is.na(cmd.totaltime.ori)) %>% 
+            select(subject, cmd.totaltime.ori)
+
+length(unique(temp$subject))
+  
+all.data$APOE_g <- NA
+all.data$APOE_g[which(all.data$APOE == "e2.e2" | all.data$APOE == "e2.e3")] <- "E2"
+all.data$APOE_g[which(all.data$APOE == "e3.e3" )] <- "E3"
+all.data$APOE_g[which(all.data$APOE == "e3.e4" | all.data$APOE == "e4.e4")] <- "E4"
+```
+
+##format data
+```{r }
+data.plot <- all.data 
+
+#create variables
+data.plot <- data.plot %>%
+  dplyr:: mutate(APOE = as.factor(APOE) ) %>%
+  dplyr:: mutate(APOE_g = as.factor(APOE_g) ) %>%
+  dplyr:: mutate(Gen2 = (DOB <= 1935)) 
+
+#revel the reference groups of APOE
+data.plot$APOE = relevel(data.plot$APOE, ref= "e3.e3" )
+data.plot$APOE_g = relevel(data.plot$APOE_g, ref= "E3" )
+```
+
+
+## some plots
+```{r}
+p<-ggplot2::ggplot(data = data.plot, aes(x=APOE, y=Age.consent))+
+     geom_boxplot() 
+print(p)
+
+hist(data.plot$cmd.inktime.ori)
+hist(data.plot$cmd.thinktime.ori)
+hist(data.plot$cmd.totaltime.ori)
+hist(data.plot$DOB) 
+```
+
+
+
+
+## Mediation analysis APOE 
+
+### APOE genotype correlation
+```{r}
+#mediator list and order them
+mediator.list <- colnames(data.plot)[grep("metab", colnames(data.plot))]
+ori.name.idx <- match(mediator.list, metab.names$fake.metab.names)
+ordered.mediator.list <- mediator.list[order(metab.names[ori.name.idx, "orig.metab.names"])]
+
+
+data.plot <- data.plot %>%
+  mutate(across(all_of(ordered.mediator.list), scale))
+
+#create correlation matrix
+corrM <- cor(data.plot[, ordered.mediator.list], use = "complete.obs")
+
+#rename correlation matrix
+ori.name.idx <- match(colnames(corrM), metab.names$fake.metab.names)
+colnames(corrM) <- metab.names[ori.name.idx, "orig.metab.names"]
+rownames(corrM) <- metab.names[ori.name.idx, "orig.metab.names"] 
+  
+corrplot(corrM, type = "upper")
+
+
+#find highly correlated pairs
+high_corrM <- corrM
+high_corrM[high_corrM <= 0.85] <- NA
+
+# If you want to avoid self-correlation (diagonal elements being 1), you can set them to NA as well
+diag(high_corrM) <- NA
+
+corrplot(high_corrM, type = "upper")
+
+
+melted_corrM <- melt(corrM)
+
+# Filter for correlation greater than 0.85 and not self-correlation
+high_correlation_pairs <- subset(melted_corrM, value > 0.85 & Var1 != Var2)
+
+# Print the pairs
+print(high_correlation_pairs)
+```
+
+## Modify
+Due to high correlation, we remove the following ones:
+
+TG 56:2
+
+TG 54:1
+
+TG 53:2
+
+dHexCer 40:1 42:1
+
+```{r}
+#removenames <- c("TG 56:2", "TG 54:1", "TG 53:2", "dHexCer_NS 40:1", "dHexCer_NS 42:1")
+#remove_fake_names <- metab.names$fake.metab.names[match(removenames, metab.names$orig.metab.names)]
+
+#ordered.mediator.list <- ordered.mediator.list[-which(ordered.mediator.list %in% remove_fake_names)]
+```
+
+
+
+## create data for pairwise comparison
+```{r}
+#data to compare E2 vs E3 (exclude E4)
+data.plot.E2vsE3 <- data.plot %>% 
+  filter(APOE_g == 'E2' | APOE_g == 'E3')
+
+#relevel factor variables
+data.plot.E2vsE3$APOE <- factor(data.plot.E2vsE3$APOE)
+data.plot.E2vsE3$APOE <- relevel(data.plot.E2vsE3$APOE, ref = "e3.e3")
+
+data.plot.E2vsE3$APOE_g <- factor(data.plot.E2vsE3$APOE_g)
+data.plot.E2vsE3$APOE_g <- relevel(data.plot.E2vsE3$APOE_g, ref = "E3")
+
+
+#data to compare E4 vs E3 (exclude E2) not used in this analysis
+# data.plot.E4vsE3 <- data.plot %>% 
+#   filter(APOE_g == 'E4' | APOE_g == 'E3')
+# 
+# data.plot.E4vsE3$APOE <- factor(data.plot.E4vsE3$APOE)
+# data.plot.E4vsE3$APOE <- relevel(data.plot.E4vsE3$APOE, ref = "e3.e3")
+# 
+# data.plot.E4vsE3$APOE_g <- factor(data.plot.E4vsE3$APOE_g)
+# data.plot.E4vsE3$APOE_g <- relevel(data.plot.E4vsE3$APOE_g, ref = "E3")
+```
+
+## summarize characteristics
+```{r}
+which.data = data.plot.E2vsE3
+which.factor = "APOE_g"
+
+
+#show data without BMI
+data.plot.E2vsE3.subset <- which.data %>%
+    dplyr::select(subject, all_of(mediator.list), all_of(which.factor), pedid, Age.consent, Age.II, Gen2, Sex, Education, lipid, cdt.cmd.timecomplete.ori, cmd.inktime.ori, cmd.thinktime.ori, cmd.totaltime.ori) %>%
+  dplyr::filter(across(c(all_of(mediator.list), all_of(which.factor), 
+                         pedid, Age.consent, Gen2, Sex, Education, lipid, cmd.totaltime.ori), ~! is.na(.)))
+
+data.plot.E2vsE3.subset %>%
+  tbl_summary(
+    by = APOE_g,
+    include = c(Age.consent,
+                Age.II,
+                Sex,
+                Education,
+                lipid,
+                cdt.cmd.timecomplete.ori,
+                cmd.totaltime.ori,
+                cmd.inktime.ori,
+                cmd.thinktime.ori
+                ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})"
+    ),
+    digits = all_continuous() ~ 1
+  )  %>%
+  add_overall
+
+
+#show data with BMI
+data.plot.E2vsE3.subset <- which.data %>%
+    dplyr::select(subject, all_of(mediator.list), all_of(which.factor), pedid, Age.consent, Age.II, Gen2, Sex, Education, lipid, bmi.b, cdt.cmd.timecomplete.ori, cmd.inktime.ori, cmd.thinktime.ori, cmd.totaltime.ori) %>%
+  dplyr::filter(across(c(all_of(mediator.list), all_of(which.factor), 
+                         pedid, Age.consent, Gen2, Sex, Education, lipid, bmi.b, cmd.totaltime.ori), ~! is.na(.)))
+
+data.plot.E2vsE3.subset %>%
+  tbl_summary(
+    by = APOE_g,
+    include = c(Age.consent,
+                Age.II,
+                Sex,
+                Education,
+                lipid,
+                bmi.b,
+                cdt.cmd.timecomplete.ori,
+                cmd.totaltime.ori,
+                cmd.inktime.ori,
+                cmd.thinktime.ori
+                ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})"
+    ),
+    digits = all_continuous() ~ 1
+  )  %>%
+  add_overall
+
+```
+
+
+## causal mediation regression function
+
+```{r}
+#which.data = data.plot
+#which.factor = "APOE"
+#which.pheno = "cmd.totaltime"
+
+
+fun_causal_med<- function(which.data, mediator.list, which.factor, which.pheno, include_bmi = F){
+  which.data$X = which.data[, which.factor]
+  
+  #step 0 crude regression
+  if (include_bmi == F){
+    which.data.sub <- which.data %>%
+      dplyr::select(all_of(which.pheno), X, pedid, Age.consent, Gen2, Sex, Education, lipid)
+    which.data.sub = na.omit(which.data.sub)
+    
+    crude.fit.formula <- as.formula(paste0(which.pheno,  "~  X + Age.consent * Gen2 + Sex + Education + lipid"))
+  }
+  else{
+    which.data.sub <- which.data %>%
+      dplyr::select(all_of(which.pheno), X, pedid, Age.consent, Gen2, Sex, Education, lipid, bmi.b)
+    which.data.sub = na.omit(which.data.sub)
+    
+    crude.fit.formula <- as.formula(paste0(which.pheno,  "~  X + Age.consent * Gen2 + Sex + Education + lipid + bmi.b"))
+  }
+  
+  crude.fit <- geeglm(crude.fit.formula, id = pedid, corstr = "exchangeable", data = which.data.sub)
+  crude.fit.coefs <- summary(crude.fit)$coefficients
+  
+  
+  ##Use this data for both mediator regression and outcome regression
+  if (include_bmi == F){
+      which.data.sub <- which.data %>%
+        dplyr::select(all_of(which.pheno), all_of(mediator.list), X, pedid, Age.consent, Gen2, Sex, Education, lipid)
+      which.data.sub = na.omit(which.data.sub)  
+  }
+  else{
+      which.data.sub <- which.data %>%
+        dplyr::select(all_of(which.pheno), all_of(mediator.list), X, pedid, Age.consent, Gen2, Sex, Education, lipid, bmi.b)
+      which.data.sub = na.omit(which.data.sub)
+  }
+  
+  #step 1 mediator regression
+  all.med.res <- c()  #a list to store all results
+  for (med_iter in mediator.list) {
+    if (include_bmi == F){
+      med.fit.formula <- as.formula(paste0( med_iter, " ~ X + Age.consent * Gen2 + Sex + Education + lipid"))
+    }
+    else{
+      med.fit.formula <- as.formula(paste0( med_iter, " ~ X + Age.consent * Gen2 + Sex + Education + lipid + bmi.b"))
+    }
+    med.fit <- geeglm(med.fit.formula, id = pedid, corstr = "exchangeable", data = which.data.sub)
+
+    #summarize the current result
+    temp.med.res<- summary(med.fit)$coefficient
+    temp.med.res <- as.data.frame(temp.med.res)
+    temp.med.res$meta.fakename <- med_iter
+    temp.med.res$coefnames <- rownames(temp.med.res)
+    
+    #combine the current results with all results
+    all.med.res <- rbind(all.med.res, temp.med.res)
+  }
+  
+  #step 2 outcome regression
+  mediators.collapse <- paste(mediator.list, collapse = "+")
+  if (include_bmi == F){
+    out.fit.formula <- as.formula(paste0(which.pheno,  "~ ", mediators.collapse , " + X + Age.consent * Gen2 + Sex + Education + lipid"))
+  }
+  else{
+    out.fit.formula <- as.formula(paste0(which.pheno,  "~ ", mediators.collapse , " + X + Age.consent * Gen2 + Sex + Education + lipid + bmi.b"))
+  }
+  out.fit <- geeglm(out.fit.formula, id = pedid, corstr = "exchangeable", data = which.data.sub)
+  out.fit.coefs <- out.fit$coefficients
+  
+  
+  #step 3 summurize all res
+  if (which.factor == "APOE_g"){
+    e2e4.est.values <- all.med.res %>%
+    group_by(meta.fakename) %>%
+    filter(coefnames == 'XE2' | coefnames == 'XE4') ##to get e2 e4 group results
+  }else{
+    e2e4.est.values <- all.med.res %>%
+    group_by(meta.fakename) %>%
+    filter(coefnames == 'Xe4.e4' | coefnames == 'Xe2.e2' |  coefnames == 'Xe2.e3') ##to get e2 e4 single genotype results
+  }
+  
+  coefs_df <- data.frame(
+      meta.fakename = names(out.fit.coefs),
+      est.out.reg = out.fit.coefs,
+      stringsAsFactors = FALSE
+  )
+
+  #'e2e4.est.values' contains the estimates for mediator regression and outcome regression, and then compute the indirect effect.
+  e2e4.est.values <- e2e4.est.values %>%
+  left_join(coefs_df, by = "meta.fakename") 
+  e2e4.est.values$ind.effect <- e2e4.est.values$Estimate * e2e4.est.values$est.out.reg  #compute the indirect effect
+  ori.name.idx <- match(e2e4.est.values$meta.fakename, metab.names$fake.metab.names )
+  e2e4.est.values$ori.met.name <- metab.names[ori.name.idx, "orig.metab.names"]
+  
+  
+  #summarize outcome regression fit
+  out.fit.coefs.all = summary(out.fit)$coefficient
+  metabs.res.idx <- grep("metab", rownames(out.fit.coefs.all))
+  ori.name.outreg.idx <- match(rownames(out.fit.coefs.all)[metabs.res.idx], metab.names$fake.metab.names )
+  rownames(out.fit.coefs.all)[metabs.res.idx] <- metab.names[ori.name.outreg.idx, "orig.metab.names"]
+  
+  
+  return(list(out.reg.coef = out.fit.coefs.all , e2e4.est.values = e2e4.est.values))
+}
+
+
+
+fun_causal_med_sensitivity <- function(which.data, mediator.list, which.factor, which.pheno, include_bmi = F){
+  which.data$X = which.data[, which.factor]
+  
+  #step 0 crude regression
+  if (include_bmi == F){
+    which.data.sub <- which.data %>%
+      dplyr::select(all_of(which.pheno), X, pedid, Age.consent, Gen2, Sex, Education, lipid)
+    which.data.sub = na.omit(which.data.sub)
+    
+    crude.fit.formula <- as.formula(paste0(which.pheno,  "~  X + Age.consent * Gen2 + Sex + Education "))
+  }
+  else{
+    which.data.sub <- which.data %>%
+      dplyr::select(all_of(which.pheno), X, pedid, Age.consent, Gen2, Sex, Education, lipid, bmi.b)
+    which.data.sub = na.omit(which.data.sub)
+    
+    crude.fit.formula <- as.formula(paste0(which.pheno,  "~  X + Age.consent * Gen2 + Sex + Education  + bmi.b"))
+  }
+  
+  crude.fit <- geeglm(crude.fit.formula, id = pedid, corstr = "exchangeable", data = which.data.sub)
+  crude.fit.coefs <- summary(crude.fit)$coefficients
+  
+  
+  ##Use this data for both mediator regression and outcome regression
+  if (include_bmi == F){
+      which.data.sub <- which.data %>%
+        dplyr::select(all_of(which.pheno), all_of(mediator.list), X, pedid, Age.consent, Gen2, Sex, Education, lipid)
+      which.data.sub = na.omit(which.data.sub)  
+  }
+  else{
+      which.data.sub <- which.data %>%
+        dplyr::select(all_of(which.pheno), all_of(mediator.list), X, pedid, Age.consent, Gen2, Sex, Education, lipid, bmi.b)
+      which.data.sub = na.omit(which.data.sub)
+  }
+  
+  #step 1 mediator regression
+  all.med.res <- c()  #a list to store all results
+  for (med_iter in mediator.list) {
+    if (include_bmi == F){
+      med.fit.formula <- as.formula(paste0( med_iter, " ~ X + Age.consent * Gen2 + Sex + Education "))
+    }
+    else{
+      med.fit.formula <- as.formula(paste0( med_iter, " ~ X + Age.consent * Gen2 + Sex + Education  + bmi.b"))
+    }
+    med.fit <- geeglm(med.fit.formula, id = pedid, corstr = "exchangeable", data = which.data.sub)
+
+    #summarize the current result
+    temp.med.res<- summary(med.fit)$coefficient
+    temp.med.res <- as.data.frame(temp.med.res)
+    temp.med.res$meta.fakename <- med_iter
+    temp.med.res$coefnames <- rownames(temp.med.res)
+    
+    #combine the current results with all results
+    all.med.res <- rbind(all.med.res, temp.med.res)
+  }
+  
+  #step 2 outcome regression
+  mediators.collapse <- paste(mediator.list, collapse = "+")
+  if (include_bmi == F){
+    out.fit.formula <- as.formula(paste0(which.pheno,  "~ ", mediators.collapse , " + X + Age.consent * Gen2 + Sex + Education "))
+  }
+  else{
+    out.fit.formula <- as.formula(paste0(which.pheno,  "~ ", mediators.collapse , " + X + Age.consent * Gen2 + Sex + Education + bmi.b"))
+  }
+  out.fit <- geeglm(out.fit.formula, id = pedid, corstr = "exchangeable", data = which.data.sub)
+  out.fit.coefs <- out.fit$coefficients
+  
+  
+  #step 3 summurize all res
+  if (which.factor == "APOE_g"){
+    e2e4.est.values <- all.med.res %>%
+    group_by(meta.fakename) %>%
+    filter(coefnames == 'XE2' | coefnames == 'XE4') ##to get e2 e4 group results
+  }else{
+    e2e4.est.values <- all.med.res %>%
+    group_by(meta.fakename) %>%
+    filter(coefnames == 'Xe4.e4' | coefnames == 'Xe2.e2' |  coefnames == 'Xe2.e3') ##to get e2 e4 single genotype results
+  }
+  
+  coefs_df <- data.frame(
+      meta.fakename = names(out.fit.coefs),
+      est.out.reg = out.fit.coefs,
+      stringsAsFactors = FALSE
+  )
+
+  #'e2e4.est.values' contains the estimates for mediator regression and outcome regression, and then compute the indirect effect.
+  e2e4.est.values <- e2e4.est.values %>%
+  left_join(coefs_df, by = "meta.fakename") 
+  e2e4.est.values$ind.effect <- e2e4.est.values$Estimate * e2e4.est.values$est.out.reg  #compute the indirect effect
+  ori.name.idx <- match(e2e4.est.values$meta.fakename, metab.names$fake.metab.names )
+  e2e4.est.values$ori.met.name <- metab.names[ori.name.idx, "orig.metab.names"]
+  
+  
+  #summarize outcome regression fit
+  out.fit.coefs.all = summary(out.fit)$coefficient
+  metabs.res.idx <- grep("metab", rownames(out.fit.coefs.all))
+  ori.name.outreg.idx <- match(rownames(out.fit.coefs.all)[metabs.res.idx], metab.names$fake.metab.names )
+  rownames(out.fit.coefs.all)[metabs.res.idx] <- metab.names[ori.name.outreg.idx, "orig.metab.names"]
+  
+  
+  return(list(out.reg.coef = out.fit.coefs.all , e2e4.est.values = e2e4.est.values))
+}
+
+```
+
+
+## bootstrap functions
+```{r}
+#########bootstrap statistics##########
+get_indi_boot <- function(dataset, random){
+  temp.data = dataset[random, ]
+  
+  res <- fun_causal_med(temp.data, mediator.list, which.factor, which.pheno, include_bmi)
+  
+  e2.indirect <- res$e2e4.est.values$ind.effect
+  e2.direct <- res$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+  combined.indirect <- sum(res$e2e4.est.values$ind.effect)
+  total.effect <- sum(res$e2e4.est.values$ind.effect) + res$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+  proportion <- combined.indirect/total.effect
+  
+  
+  return(c(e2.indirect,
+           e2.direct,
+           combined.indirect,
+           total.effect,
+           proportion))
+}
+
+#########CIs from bootstrap all functions##########
+get_reg_and_CIs <- function(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length){ 
+  ##run bootstrap
+  bootres = boot(data = which.data,
+                 statistic = get_indi_boot,
+                 R = boot.length)
+  
+  ##get lower and upper confidence intervals
+  all_CI <- c()
+  for (i in 1:length(bootres$t0)){
+    temp_res <- boot.ci(bootres, type = "perc", index = i)
+    all_CI <- rbind(all_CI, round(temp_res$percent[4:5], 4))
+  }
+  
+  #organize results
+  rownames(all_CI) <- c(test_out$e2e4.est.values$ori.met.name,  "e2.direct", "combined indirect effect", "total effect", "proportion")
+  all_CI <- cbind(bootres$t0, all_CI)
+  colnames(all_CI) <- c("est.", "lower CI", "upper CI")
+  
+  
+  #find significant lipids based on their CIs
+  sig_CI <- all_CI[-which(all_CI[,2] < 0 & all_CI[, 3] >0), ]
+  
+  
+  return(list(all_CI = all_CI,
+              sum_all_CI = sum(as.numeric(all_CI[,1])),
+              sig_CI = sig_CI))
+  }
+
+```
+
+
+## variable selection functions
+```{r}
+
+var_selection <- function(which.data, mediator.list, which.factor, which.pheno, include_bmi = F){
+which.data$X = which.data[, which.factor]
+
+if(include_bmi == F){
+  which.data.sub <- which.data %>%
+   dplyr::select(which.pheno, all_of(mediator.list), X, pedid, Age.consent, Gen2, Sex, Education, lipid)
+  which.data.sub = na.omit(which.data.sub)
+}
+else{
+  which.data.sub <- which.data %>%
+   dplyr::select(which.pheno, all_of(mediator.list), X, pedid, Age.consent, Gen2, Sex, Education, lipid, bmi.b)
+  which.data.sub = na.omit(which.data.sub)
+}
+
+mediators.collapse <- paste(mediator.list, collapse = "+")
+
+##start the biggest model
+if (include_bmi == F){
+  outreg.upper.formula <- as.formula(paste0(which.pheno,  "~ ", mediators.collapse , " + X + Age.consent * Gen2 + Sex + Education + lipid"))
+}
+else{
+  outreg.upper.formula <- as.formula(paste0(which.pheno,  "~ ", mediators.collapse , " + X + Age.consent * Gen2 + Sex + Education + lipid + bmi.b"))
+}
+
+outreg.upper.fit <- lm(outreg.upper.formula, data = which.data.sub)
+
+##the minimal model
+if (include_bmi == F){
+  outreg.lower.formula <- as.formula(paste0(which.pheno,  "~ ", "X + Age.consent * Gen2 + Sex + Education + lipid"))
+}else{
+  outreg.lower.formula <- as.formula(paste0(which.pheno,  "~ ", "X + Age.consent * Gen2 + Sex + Education + lipid + bmi.b"))
+}
+
+outreg.lower.fit <- lm(outreg.lower.formula, data = which.data.sub)
+
+
+step_mod <- stepAIC(outreg.upper.fit, 
+                    scope = list(lower = outreg.lower.fit, upper = outreg.upper.fit),
+                    direction = "backward", 
+                    trace = TRUE)
+
+return (step_mod)
+}
+```
+
+## e2 genotype group vs e3 genotype group
+
+## Phenotype 1: cmd.totaltime
+### before variable selection
+```{r}
+which.data = data.plot.E2vsE3
+which.factor = "APOE_g"
+which.pheno = "cmd.totaltime.ori"
+mediator.list = ordered.mediator.list 
+include_bmi = T
+boot.length = 1500
+
+test_out<- fun_causal_med(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#get indirect effect
+test_out$e2e4.est.values$ind.effect
+#get direct effects from outcome regression
+test_out$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+
+
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+### 2ndery analysis: after variable selection
+```{r}
+###reset mediator list
+mediator.list = ordered.mediator.list
+
+###Stepwise variable selection using the previous defined function
+step_mod <- var_selection(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#find the lipids from the selected model
+mediator.list <- names(step_mod$coefficients)[grep("metab", names(step_mod$coefficients))]
+
+test_out<- fun_causal_med(which.data, mediator.list, which.factor, which.pheno)
+test_out$e2e4.est.values
+test_out$out.reg.coef
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+#save the results
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.selection.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+
+### sensitivity analysis: taken the lipid drugs off
+
+```{r}
+mediator.list = ordered.mediator.list 
+
+
+test_out<- fun_causal_med_sensitivity(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#get indirect effect
+test_out$e2e4.est.values$ind.effect
+#get direct effects from outcome regression
+test_out$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+
+
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.sensitivity.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+
+## Phenotype 1.a: "cmd.inktime.ori"  
+### before variable selection
+```{r}
+#```{r, eval = F}
+which.data = data.plot.E2vsE3
+which.factor = "APOE_g"
+which.pheno = "cmd.inktime.ori"  
+mediator.list = ordered.mediator.list   #reset mediator list
+
+test_out<- fun_causal_med(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#get indirect effect
+test_out$e2e4.est.values$ind.effect
+
+#get direct effects from outcome regression
+test_out$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.2025.07.", which.pheno, ".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+
+### after variable selection
+```{r}
+#```{r, eval = F}
+###reset mediator list
+mediator.list = ordered.mediator.list
+
+###Stepwise variable selection using the previous defined function
+step_mod <- var_selection(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#find the lipids from the selected model
+mediator.list <- names(step_mod$coefficients)[grep("metab", names(step_mod$coefficients))]
+
+
+test_out<- fun_causal_med(which.data, mediator.list, which.factor, which.pheno)
+test_out$e2e4.est.values
+test_out$out.reg.coef
+
+
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.selection.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+
+### sensitivity analysis: taken the lipid drugs off
+
+```{r}
+mediator.list = ordered.mediator.list 
+
+
+test_out<- fun_causal_med_sensitivity(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#get indirect effect
+test_out$e2e4.est.values$ind.effect
+#get direct effects from outcome regression
+test_out$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+
+
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.sensitivity.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+
+## Phenotype 1.b: "cmd.thinktime.ori"
+### before variable selection
+```{r}
+#```{r, eval = F}
+which.data = data.plot.E2vsE3
+which.factor = "APOE_g"
+which.pheno = "cmd.thinktime.ori"
+mediator.list = ordered.mediator.list  #reset mediator list
+
+test_out<- fun_causal_med(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#get indirect effect
+test_out$e2e4.est.values$ind.effect
+
+#get direct effects from outcome regression
+test_out$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+
+### after variable selection
+```{r}
+#```{r, eval = F}
+###reset mediator list
+mediator.list = ordered.mediator.list
+
+###Stepwise variable selection using the previous defined function
+step_mod <- var_selection(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#find the lipids from the selected model
+mediator.list <- names(step_mod$coefficients)[grep("metab", names(step_mod$coefficients))]
+
+
+test_out<- fun_causal_med(which.data, mediator.list, which.factor, which.pheno)
+test_out$e2e4.est.values
+test_out$out.reg.coef
+
+####Bootstrap CI######
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+  
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.selection.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+### sensitivity analysis: taken the lipid drugs off
+
+```{r}
+mediator.list = ordered.mediator.list 
+
+
+test_out<- fun_causal_med_sensitivity(which.data, mediator.list, which.factor, which.pheno, include_bmi)
+
+#get indirect effect
+test_out$e2e4.est.values$ind.effect
+#get direct effects from outcome regression
+test_out$out.reg.coef[rownames(test_out$out.reg.coef) == "XE2", "Estimate"]
+
+
+
+bootstrap_res <- get_reg_and_CIs(which.data, mediator.list, which.factor, which.pheno, include_bmi, boot.length)
+
+temp.list <-
+    list(mediator = test_out$e2e4.est.values,
+         outcome = test_out$out.reg.coef,
+         all_CI = bootstrap_res$all_CI,
+         sig_CI = bootstrap_res$sig_CI)
+
+openxlsx::write.xlsx(
+    temp.list,
+    paste0(
+      "/restricted/projectnb/llfs/LinGA_protected/analysis/Qingyan/mediation/res/causal/res.APOE_g.sensitivity.2025.07.", which.pheno,".bmi",include_bmi, ".xlsx"),
+    rowNames = T
+    )
+```
+
+
